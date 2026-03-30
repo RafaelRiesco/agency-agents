@@ -381,3 +381,131 @@ function getMetaAdData() {
 
   Logger.log('Anuncios escritos: ' + (fila - 41));
 }
+function unificarData() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                  .getSheetByName('Data Meta');
+  
+  // Leer campañas (fila 1 headers, filas 2-15)
+  const headersCampana = sheet.getRange(1, 1, 1, 8).getValues()[0];
+  const datosCampana = sheet.getRange(2, 1, 15, 8).getValues()
+    .filter(fila => fila[0] !== '');
+
+  // Leer adsets (fila 20 headers, filas 21-35)
+  const headersAdset = sheet.getRange(20, 1, 1, 9).getValues()[0];
+  const datosAdset = sheet.getRange(21, 1, 15, 9).getValues()
+    .filter(fila => fila[0] !== '');
+
+  // Leer anuncios (fila 40 headers, filas 41-80)
+  const headersAnuncio = sheet.getRange(40, 1, 1, 10).getValues()[0];
+  const datosAnuncio = sheet.getRange(41, 1, 40, 10).getValues()
+    .filter(fila => fila[0] !== '');
+
+  // Formatear campañas
+  let textoCampanas = '## NIVEL CAMPAÑA\n';
+  datosCampana.forEach(fila => {
+    textoCampanas += `
+Campaña: ${fila[0]}
+Gasto: ${fila[1].toLocaleString()} CLP
+Impresiones: ${fila[2].toLocaleString()}
+Clicks: ${fila[3].toLocaleString()}
+CTR: ${fila[4]}
+CPC: ${fila[5]} CLP
+Frecuencia: ${fila[6]}
+ROAS: ${fila[7]}
+---`;
+  });
+
+  // Formatear adsets
+  let textoAdsets = '\n## NIVEL ADSET\n';
+  datosAdset.forEach(fila => {
+    textoAdsets += `
+Campaña: ${fila[0]} | Adset: ${fila[1]}
+Gasto: ${fila[2].toLocaleString()} CLP | CTR: ${fila[5]} | CPC: ${fila[6]} CLP
+Frecuencia: ${fila[7]} | ROAS: ${fila[8]}
+---`;
+  });
+
+  // Formatear anuncios — solo los relevantes (gasto > 0 y ROAS conocido)
+  let textoAnuncios = '\n## NIVEL ANUNCIO\n';
+  datosAnuncio
+    .filter(fila => fila[3] > 0 && fila[9] > 0)
+    .sort((a, b) => b[9] - a[9]) // ordenar por ROAS descendente
+    .forEach(fila => {
+      textoAnuncios += `
+Anuncio: ${fila[2]} | Adset: ${fila[1]}
+Gasto: ${fila[3].toLocaleString()} CLP | CTR: ${fila[6]} | ROAS: ${fila[9]}
+---`;
+    });
+
+  const textoCompleto = textoCampanas + textoAdsets + textoAnuncios;
+  Logger.log(textoCompleto);
+  return textoCompleto;
+}
+function runFullAnalysis() {
+  const data = unificarData();
+  
+  const configSheet = SpreadsheetApp.getActiveSpreadsheet()
+                        .getSheetByName('Config');
+  const configData = configSheet.getDataRange().getValues();
+  
+  // Leer config
+  let config = {};
+  configData.forEach(fila => {
+    if (fila[0] && fila[1]) config[fila[0]] = fila[1];
+  });
+
+  const prompt = `
+Eres un estratega senior de paid media para ${config['Negocio'] || 'cadacosaensulugar.cl'}, un ecommerce chileno de organización del hogar con ${config['Margen bruto promedio'] || '60%'} de margen bruto.
+
+BENCHMARKS DEL NEGOCIO:
+- ROAS objetivo: ${config['ROAS objetivo retargeting'] || '5.0'}
+- ROAS mínimo prospecting: ${config['ROAS objetivo prospecting'] || '3.0'}
+- ROAS alerta roja: ${config['ROAS mínimo absoluto (alerta roja)'] || '1.7'}
+- Frecuencia máxima: ${config['Frecuencia máxima retargeting'] || '5.0'}
+- CTR promedio cuenta: ${config['CTR promedio Meta'] || '1.80%'}
+- Ticket promedio: ${config['Ticket promedio (CLP)'] || '63629'} CLP
+
+CONTEXTO ACTIVO: ${config['Contexto activo'] || 'Sin contexto especial'}
+
+DATOS DE CAMPAÑAS (últimos 7 días):
+${data}
+
+Responde estas 5 preguntas con datos concretos:
+
+1. ¿Qué campañas deben pausarse o revisarse urgente? (justifica con ROAS vs benchmark)
+2. ¿Qué campañas tienen ROAS sobre objetivo y pueden escalar presupuesto?
+3. ¿Qué categoría de producto está generando el mejor retorno?
+4. ¿Qué anuncios específicos tienen mejor performance y deben replicarse?
+5. ¿Cuál es la acción de mayor palanca esta semana?
+
+Formato de respuesta:
+- Usa los tres niveles (campaña, adset, anuncio) para justificar cada recomendación
+- Sé directo y específico — nombra campañas y anuncios reales
+- Máximo 15 líneas en total
+`;
+
+  const resultado = callClaude(prompt);
+  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                  .getSheetByName('Análisis');
+  
+  // Limpiar análisis anterior
+  sheet.getRange('A1:B10').clearContent();
+  
+  sheet.getRange('A1').setValue('Reporte semanal — ' + new Date().toLocaleDateString('es-CL'));
+  sheet.getRange('A2').setValue(resultado);
+  sheet.getRange('A2').setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+  
+  Logger.log(resultado);
+  
+  SpreadsheetApp.getUi().alert('✅ Análisis completado. Revisa la pestaña Análisis.');
+}
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🤖 Agente Marketing')
+    .addItem('Correr análisis semanal', 'runFullAnalysis')
+    .addItem('Actualizar data Meta', 'procesarMetaAPI')
+    .addItem('Actualizar adsets', 'getMetaAdsetData')
+    .addItem('Actualizar anuncios', 'getMetaAdData')
+    .addToUi();
+}
