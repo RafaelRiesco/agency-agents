@@ -159,3 +159,225 @@ function analizarCampanasReales() {
   
   Logger.log(resultado);
 }
+function getMetaAdsData() {
+  const token = PropertiesService.getScriptProperties()
+                  .getProperty('META_ACCESS_TOKEN');
+  
+  // Obtener el Ad Account ID
+  const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name&access_token=${token}`;
+  const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
+  const dataAccount = JSON.parse(responseAccount.getContentText());
+  
+  Logger.log('Cuentas disponibles: ' + JSON.stringify(dataAccount));
+  
+  if (!dataAccount.data || dataAccount.data.length === 0) {
+    Logger.log('Error: No se encontraron cuentas de anuncios');
+    return null;
+  }
+  
+  const adAccountId = dataAccount.data[0].id;
+  Logger.log('Usando cuenta: ' + adAccountId);
+  
+  // Obtener métricas de campañas
+  const fechaHoy = new Date();
+  const fecha30dias = new Date(fechaHoy - 30 * 24 * 60 * 60 * 1000);
+  const fechaInicio = fecha30dias.toISOString().split('T')[0];
+  const fechaFin = fechaHoy.toISOString().split('T')[0];
+  
+  const fields = 'campaign_name,spend,impressions,clicks,ctr,cpc,frequency,reach,actions,action_values';
+  const timeRange = encodeURIComponent(JSON.stringify({since: fechaInicio, until: fechaFin}));
+  const url = `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=${fields}&time_range=${timeRange}&level=campaign&access_token=${token}`;
+  
+  const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  const data = JSON.parse(response.getContentText());
+  
+  Logger.log('Respuesta API: ' + JSON.stringify(data));
+  return data;
+}
+function procesarMetaAPI() {
+  const data = getMetaAdsData();
+  if (!data || !data.data) {
+    Logger.log('Sin datos');
+    return;
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                  .getSheetByName('Data Meta');
+  
+  // Limpiar sheet
+  sheet.clearContents();
+    sheet.getRange('B:H').setNumberFormat('0.00');
+    sheet.getRange('B:D').setNumberFormat('0');
+  
+  // Headers
+  sheet.getRange(1, 1, 1, 8).setValues([[
+    'Campaña', 'Gasto (CLP)', 'Impresiones', 'Clicks', 
+    'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
+  ]]);
+
+  let fila = 2;
+  
+  data.data.forEach(campana => {
+    // Calcular ROAS
+    let valorConversion = 0;
+    let compras = 0;
+    
+    if (campana.action_values) {
+      const purchaseAction = campana.action_values.find(
+        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
+      );
+      if (purchaseAction) valorConversion = parseFloat(purchaseAction.value);
+    }
+
+    if (campana.actions) {
+      const purchaseCount = campana.actions.find(
+        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
+      );
+      if (purchaseCount) compras = parseFloat(purchaseCount.value);
+    }
+
+    const gasto = parseFloat(campana.spend) || 0;
+    const roas = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
+
+    if (gasto === 0) return; // Skip campañas sin gasto
+
+    sheet.getRange(fila, 1, 1, 8).setValues([[
+      String(campana.campaign_name),
+      Number(gasto),
+      Number(campana.impressions),
+      Number(campana.clicks),
+      String((parseFloat(campana.ctr)).toFixed(2) + '%'),
+      Number(parseFloat(campana.cpc).toFixed(0)),
+      Number(parseFloat(campana.frequency).toFixed(2)),
+      Number(roas)
+    ]]);
+    fila++;
+  });
+
+  Logger.log('Datos escritos en Data Meta: ' + (fila - 2) + ' campañas');
+}
+function getMetaAdsetData() {
+  const token = PropertiesService.getScriptProperties()
+                  .getProperty('META_ACCESS_TOKEN');
+  
+  const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id&access_token=${token}`;
+  const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
+  const dataAccount = JSON.parse(responseAccount.getContentText());
+  const adAccountId = dataAccount.data[0].id;
+
+  const fechaHoy = new Date();
+  const fecha7dias = new Date(fechaHoy - 7 * 24 * 60 * 60 * 1000);
+  const fechaInicio = fecha7dias.toISOString().split('T')[0];
+  const fechaFin = fechaHoy.toISOString().split('T')[0];
+
+  const fields = 'campaign_name,adset_name,spend,impressions,clicks,ctr,cpc,frequency,reach,actions,action_values';
+  const timeRange = encodeURIComponent(JSON.stringify({since: fechaInicio, until: fechaFin}));
+  const url = `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=${fields}&time_range=${timeRange}&level=adset&access_token=${token}`;
+
+  const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  const data = JSON.parse(response.getContentText());
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                  .getSheetByName('Data Meta');
+
+  // Escribir desde fila 20 para no pisar los datos de campaña
+  sheet.getRange('A20:I20').setValues([[
+    'Campaña', 'Adset', 'Gasto (CLP)', 'Impresiones',
+    'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
+  ]]);
+
+  let fila = 21;
+
+  data.data.forEach(adset => {
+    const gasto = parseFloat(adset.spend) || 0;
+    if (gasto === 0) return;
+
+    let valorConversion = 0;
+    if (adset.action_values) {
+      const purchase = adset.action_values.find(
+        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
+      );
+      if (purchase) valorConversion = parseFloat(purchase.value);
+    }
+
+    const roas = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
+
+    sheet.getRange(fila, 1, 1, 9).setValues([[
+      String(adset.campaign_name),
+      String(adset.adset_name),
+      Number(gasto),
+      Number(adset.impressions),
+      Number(adset.clicks),
+      String(parseFloat(adset.ctr).toFixed(2) + '%'),
+      Number(parseFloat(adset.cpc).toFixed(0)),
+      Number(parseFloat(adset.frequency).toFixed(2)),
+      Number(roas)
+    ]]);
+    fila++;
+  });
+
+  Logger.log('Adsets escritos: ' + (fila - 21));
+}
+function getMetaAdData() {
+  const token = PropertiesService.getScriptProperties()
+                  .getProperty('META_ACCESS_TOKEN');
+  
+  const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id&access_token=${token}`;
+  const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
+  const dataAccount = JSON.parse(responseAccount.getContentText());
+  const adAccountId = dataAccount.data[0].id;
+
+  const fechaHoy = new Date();
+  const fecha7dias = new Date(fechaHoy - 7 * 24 * 60 * 60 * 1000);
+  const fechaInicio = fecha7dias.toISOString().split('T')[0];
+  const fechaFin = fechaHoy.toISOString().split('T')[0];
+
+  const fields = 'campaign_name,adset_name,ad_name,spend,impressions,clicks,ctr,cpc,frequency,reach,actions,action_values';
+  const timeRange = encodeURIComponent(JSON.stringify({since: fechaInicio, until: fechaFin}));
+  const url = `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=${fields}&time_range=${timeRange}&level=ad&access_token=${token}`;
+
+  const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  const data = JSON.parse(response.getContentText());
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                  .getSheetByName('Data Meta');
+
+  // Escribir desde fila 40 para no pisar campañas ni adsets
+  sheet.getRange('A40:J40').setValues([[
+    'Campaña', 'Adset', 'Anuncio', 'Gasto (CLP)', 'Impresiones',
+    'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
+  ]]);
+
+  let fila = 41;
+
+  data.data.forEach(ad => {
+    const gasto = parseFloat(ad.spend) || 0;
+    if (gasto === 0) return;
+
+    let valorConversion = 0;
+    if (ad.action_values) {
+      const purchase = ad.action_values.find(
+        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
+      );
+      if (purchase) valorConversion = parseFloat(purchase.value);
+    }
+
+    const roas = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
+
+    sheet.getRange(fila, 1, 1, 10).setValues([[
+      String(ad.campaign_name),
+      String(ad.adset_name),
+      String(ad.ad_name),
+      Number(gasto),
+      Number(ad.impressions),
+      Number(ad.clicks),
+      String(parseFloat(ad.ctr).toFixed(2) + '%'),
+      Number(parseFloat(ad.cpc).toFixed(0)),
+      Number(parseFloat(ad.frequency).toFixed(2)),
+      Number(roas)
+    ]]);
+    fila++;
+  });
+
+  Logger.log('Anuncios escritos: ' + (fila - 41));
+}
