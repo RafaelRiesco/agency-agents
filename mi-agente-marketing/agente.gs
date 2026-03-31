@@ -163,25 +163,40 @@ function getMetaAdsData() {
   const token = PropertiesService.getScriptProperties()
                   .getProperty('META_ACCESS_TOKEN');
   
-  // Obtener el Ad Account ID
-  const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name&access_token=${token}`;
+  const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id&access_token=${token}`;
   const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
   const dataAccount = JSON.parse(responseAccount.getContentText());
   
-  Logger.log('Cuentas disponibles: ' + JSON.stringify(dataAccount));
-  
   if (!dataAccount.data || dataAccount.data.length === 0) {
-    Logger.log('Error: No se encontraron cuentas de anuncios');
+    Logger.log('Error: No se encontraron cuentas');
     return null;
   }
   
   const adAccountId = dataAccount.data[0].id;
-  Logger.log('Usando cuenta: ' + adAccountId);
+
+  // 1. Traer estado y fecha inicio desde endpoint de campañas
+  const urlCampanas = `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?fields=name,configured_status,start_time&access_token=${token}`;
+  const responseCampanas = UrlFetchApp.fetch(urlCampanas, {muteHttpExceptions: true});
+  const dataCampanas = JSON.parse(responseCampanas.getContentText());
   
-  // Obtener métricas de campañas
+  // Crear mapa nombre → {estado, diasActiva}
+  const mapaCampanas = {};
+  if (dataCampanas.data) {
+    dataCampanas.data.forEach(c => {
+      const diasActiva = c.start_time 
+        ? Math.floor((new Date() - new Date(c.start_time)) / (1000 * 60 * 60 * 24))
+        : 0;
+      mapaCampanas[c.name] = {
+        estado: c.configured_status,
+        diasActiva: diasActiva
+      };
+    });
+  }
+
+  // 2. Traer métricas de insights
   const fechaHoy = new Date();
-  const fecha30dias = new Date(fechaHoy - 30 * 24 * 60 * 60 * 1000);
-  const fechaInicio = fecha30dias.toISOString().split('T')[0];
+  const fecha7dias = new Date(fechaHoy - 7 * 24 * 60 * 60 * 1000);
+  const fechaInicio = fecha7dias.toISOString().split('T')[0];
   const fechaFin = fechaHoy.toISOString().split('T')[0];
   
   const fields = 'campaign_name,spend,impressions,clicks,ctr,cpc,frequency,reach,actions,action_values';
@@ -190,8 +205,15 @@ function getMetaAdsData() {
   
   const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
   const data = JSON.parse(response.getContentText());
-  
-  Logger.log('Respuesta API: ' + JSON.stringify(data));
+
+  // 3. Combinar insights con estado y días activa
+  if (data.data) {
+    data.data = data.data.map(c => {
+      const info = mapaCampanas[c.campaign_name] || {estado: 'unknown', diasActiva: 0};
+      return {...c, configured_status: info.estado, dias_activa: info.diasActiva};
+    });
+  }
+
   return data;
 }
 function procesarMetaAPI() {
@@ -204,57 +226,49 @@ function procesarMetaAPI() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
                   .getSheetByName('Data Meta');
   
-  // Limpiar sheet
   sheet.clearContents();
-    sheet.getRange('B:H').setNumberFormat('0.00');
-    sheet.getRange('B:D').setNumberFormat('0');
   
-  // Headers
-  sheet.getRange(1, 1, 1, 8).setValues([[
-    'Campaña', 'Gasto (CLP)', 'Impresiones', 'Clicks', 
-    'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
+  sheet.getRange(1, 1, 1, 10).setValues([[
+    'Campaña', 'Estado', 'Días activa', 'Gasto (CLP)', 'Impresiones', 
+    'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
   ]]);
 
   let fila = 2;
   
   data.data.forEach(campana => {
-    // Calcular ROAS
-    let valorConversion = 0;
-    let compras = 0;
-    
-    if (campana.action_values) {
-      const purchaseAction = campana.action_values.find(
-        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
-      );
-      if (purchaseAction) valorConversion = parseFloat(purchaseAction.value);
-    }
-
-    if (campana.actions) {
-      const purchaseCount = campana.actions.find(
-        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
-      );
-      if (purchaseCount) compras = parseFloat(purchaseCount.value);
-    }
-
     const gasto = parseFloat(campana.spend) || 0;
+    if (gasto === 0) return;
+
+    const estado = campana.configured_status || 'unknown';
+    const diasActiva = campana.dias_activa || 0;
+
+    let valorConversion = 0;
+    if (campana.action_values) {
+      const purchase = campana.action_values.find(
+        a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
+      );
+      if (purchase) valorConversion = parseFloat(purchase.value);
+    }
+
     const roas = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
 
-    if (gasto === 0) return; // Skip campañas sin gasto
-
-    sheet.getRange(fila, 1, 1, 8).setValues([[
+    sheet.getRange(fila, 1, 1, 10).setValues([[
       String(campana.campaign_name),
+      String(estado),
+      Number(diasActiva),
       Number(gasto),
-      Number(campana.impressions),
-      Number(campana.clicks),
-      String((parseFloat(campana.ctr)).toFixed(2) + '%'),
-      Number(parseFloat(campana.cpc).toFixed(0)),
-      Number(parseFloat(campana.frequency).toFixed(2)),
+      Number(campana.impressions || 0),
+      Number(campana.clicks || 0),
+      String(parseFloat(campana.ctr || 0).toFixed(2) + '%'),
+      Number(parseFloat(campana.cpc || 0).toFixed(0)),
+      Number(parseFloat(campana.frequency || 0).toFixed(2)),
       Number(roas)
     ]]);
     fila++;
   });
 
-  Logger.log('Datos escritos en Data Meta: ' + (fila - 2) + ' campañas');
+  Logger.log('Campañas escritas: ' + (fila - 2));
+  SpreadsheetApp.getUi().alert('✅ Data Meta actualizada: ' + (fila - 2) + ' campañas.');
 }
 function getMetaAdsetData() {
   const token = PropertiesService.getScriptProperties()
@@ -263,8 +277,33 @@ function getMetaAdsetData() {
   const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id&access_token=${token}`;
   const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
   const dataAccount = JSON.parse(responseAccount.getContentText());
+  
+  if (!dataAccount.data || dataAccount.data.length === 0) {
+    SpreadsheetApp.getUi().alert('❌ Error de autenticación. Token expirado.');
+    return;
+  }
+  
   const adAccountId = dataAccount.data[0].id;
 
+  // 1. Traer estado y fecha inicio de adsets
+  const urlAdsets = `https://graph.facebook.com/v19.0/${adAccountId}/adsets?fields=name,configured_status,start_time&access_token=${token}`;
+  const responseAdsets = UrlFetchApp.fetch(urlAdsets, {muteHttpExceptions: true});
+  const dataAdsets = JSON.parse(responseAdsets.getContentText());
+  
+  const mapaAdsets = {};
+  if (dataAdsets.data) {
+    dataAdsets.data.forEach(a => {
+      const diasActiva = a.start_time
+        ? Math.floor((new Date() - new Date(a.start_time)) / (1000 * 60 * 60 * 24))
+        : 0;
+      mapaAdsets[a.name] = {
+        estado: a.configured_status,
+        diasActiva: diasActiva
+      };
+    });
+  }
+
+  // 2. Traer métricas
   const fechaHoy = new Date();
   const fecha7dias = new Date(fechaHoy - 7 * 24 * 60 * 60 * 1000);
   const fechaInicio = fecha7dias.toISOString().split('T')[0];
@@ -277,13 +316,23 @@ function getMetaAdsetData() {
   const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
   const data = JSON.parse(response.getContentText());
 
+  if (!data.data) {
+    SpreadsheetApp.getUi().alert('❌ Error API adsets: ' + JSON.stringify(data.error || data));
+    return;
+  }
+
+  // 3. Combinar
+  data.data = data.data.map(a => {
+    const info = mapaAdsets[a.adset_name] || {estado: 'unknown', diasActiva: 0};
+    return {...a, configured_status: info.estado, dias_activa: info.diasActiva};
+  });
+
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
                   .getSheetByName('Data Meta');
 
-  // Escribir desde fila 20 para no pisar los datos de campaña
-  sheet.getRange('A20:I20').setValues([[
-    'Campaña', 'Adset', 'Gasto (CLP)', 'Impresiones',
-    'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
+  sheet.getRange('A20:K20').setValues([[
+    'Campaña', 'Adset', 'Estado', 'Días activa', 'Gasto (CLP)', 
+    'Impresiones', 'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
   ]]);
 
   let fila = 21;
@@ -291,6 +340,9 @@ function getMetaAdsetData() {
   data.data.forEach(adset => {
     const gasto = parseFloat(adset.spend) || 0;
     if (gasto === 0) return;
+
+    const estado = adset.configured_status || 'unknown';
+    const diasActiva = adset.dias_activa || 0;
 
     let valorConversion = 0;
     if (adset.action_values) {
@@ -302,21 +354,24 @@ function getMetaAdsetData() {
 
     const roas = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
 
-    sheet.getRange(fila, 1, 1, 9).setValues([[
+    sheet.getRange(fila, 1, 1, 11).setValues([[
       String(adset.campaign_name),
       String(adset.adset_name),
+      String(estado),
+      Number(diasActiva),
       Number(gasto),
-      Number(adset.impressions),
-      Number(adset.clicks),
-      String(parseFloat(adset.ctr).toFixed(2) + '%'),
-      Number(parseFloat(adset.cpc).toFixed(0)),
-      Number(parseFloat(adset.frequency).toFixed(2)),
+      Number(adset.impressions || 0),
+      Number(adset.clicks || 0),
+      String(parseFloat(adset.ctr || 0).toFixed(2) + '%'),
+      Number(parseFloat(adset.cpc || 0).toFixed(0)),
+      Number(parseFloat(adset.frequency || 0).toFixed(2)),
       Number(roas)
     ]]);
     fila++;
   });
 
   Logger.log('Adsets escritos: ' + (fila - 21));
+  SpreadsheetApp.getUi().alert('✅ Adsets actualizados: ' + (fila - 21));
 }
 function getMetaAdData() {
   const token = PropertiesService.getScriptProperties()
@@ -325,8 +380,33 @@ function getMetaAdData() {
   const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id&access_token=${token}`;
   const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
   const dataAccount = JSON.parse(responseAccount.getContentText());
+  
+  if (!dataAccount.data || dataAccount.data.length === 0) {
+    SpreadsheetApp.getUi().alert('❌ Error de autenticación. Token expirado.');
+    return;
+  }
+  
   const adAccountId = dataAccount.data[0].id;
 
+  // 1. Traer estado y fecha inicio de anuncios
+  const urlAds = `https://graph.facebook.com/v19.0/${adAccountId}/ads?fields=name,configured_status,created_time&access_token=${token}`;
+  const responseAds = UrlFetchApp.fetch(urlAds, {muteHttpExceptions: true});
+  const dataAds = JSON.parse(responseAds.getContentText());
+  
+  const mapaAds = {};
+  if (dataAds.data) {
+    dataAds.data.forEach(a => {
+      const diasActiva = a.created_time
+        ? Math.floor((new Date() - new Date(a.created_time)) / (1000 * 60 * 60 * 24))
+        : 0;
+      mapaAds[a.name] = {
+        estado: a.configured_status,
+        diasActiva: diasActiva
+      };
+    });
+  }
+
+  // 2. Traer métricas
   const fechaHoy = new Date();
   const fecha7dias = new Date(fechaHoy - 7 * 24 * 60 * 60 * 1000);
   const fechaInicio = fecha7dias.toISOString().split('T')[0];
@@ -339,13 +419,23 @@ function getMetaAdData() {
   const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
   const data = JSON.parse(response.getContentText());
 
+  if (!data.data) {
+    SpreadsheetApp.getUi().alert('❌ Error API anuncios: ' + JSON.stringify(data.error || data));
+    return;
+  }
+
+  // 3. Combinar
+  data.data = data.data.map(a => {
+    const info = mapaAds[a.ad_name] || {estado: 'unknown', diasActiva: 0};
+    return {...a, configured_status: info.estado, dias_activa: info.diasActiva};
+  });
+
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
                   .getSheetByName('Data Meta');
 
-  // Escribir desde fila 40 para no pisar campañas ni adsets
-  sheet.getRange('A40:J40').setValues([[
-    'Campaña', 'Adset', 'Anuncio', 'Gasto (CLP)', 'Impresiones',
-    'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
+  sheet.getRange('A40:L40').setValues([[
+    'Campaña', 'Adset', 'Anuncio', 'Estado', 'Días activa',
+    'Gasto (CLP)', 'Impresiones', 'Clicks', 'CTR', 'CPC (CLP)', 'Frecuencia', 'ROAS'
   ]]);
 
   let fila = 41;
@@ -353,6 +443,9 @@ function getMetaAdData() {
   data.data.forEach(ad => {
     const gasto = parseFloat(ad.spend) || 0;
     if (gasto === 0) return;
+
+    const estado = ad.configured_status || 'unknown';
+    const diasActiva = ad.dias_activa || 0;
 
     let valorConversion = 0;
     if (ad.action_values) {
@@ -364,140 +457,199 @@ function getMetaAdData() {
 
     const roas = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
 
-    sheet.getRange(fila, 1, 1, 10).setValues([[
+    sheet.getRange(fila, 1, 1, 12).setValues([[
       String(ad.campaign_name),
       String(ad.adset_name),
       String(ad.ad_name),
+      String(estado),
+      Number(diasActiva),
       Number(gasto),
-      Number(ad.impressions),
-      Number(ad.clicks),
-      String(parseFloat(ad.ctr).toFixed(2) + '%'),
-      Number(parseFloat(ad.cpc).toFixed(0)),
-      Number(parseFloat(ad.frequency).toFixed(2)),
+      Number(ad.impressions || 0),
+      Number(ad.clicks || 0),
+      String(parseFloat(ad.ctr || 0).toFixed(2) + '%'),
+      Number(parseFloat(ad.cpc || 0).toFixed(0)),
+      Number(parseFloat(ad.frequency || 0).toFixed(2)),
       Number(roas)
     ]]);
     fila++;
   });
 
   Logger.log('Anuncios escritos: ' + (fila - 41));
+  SpreadsheetApp.getUi().alert('✅ Anuncios actualizados: ' + (fila - 41));
 }
 function unificarData() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
                   .getSheetByName('Data Meta');
-  
-  // Leer campañas (fila 1 headers, filas 2-15)
-  const headersCampana = sheet.getRange(1, 1, 1, 8).getValues()[0];
-  const datosCampana = sheet.getRange(2, 1, 15, 8).getValues()
+
+  // Leer contexto activo
+  const configSheet = SpreadsheetApp.getActiveSpreadsheet()
+                        .getSheetByName('Config');
+  const configData = configSheet.getDataRange().getValues();
+  let contextoActivo = 'Sin contexto especial';
+  configData.forEach(fila => {
+    if (fila[0] === 'Contexto activo') contextoActivo = fila[1];
+  });
+
+  // Campañas: 0=Nombre, 1=Estado, 2=Días, 3=Gasto, 4=Impresiones
+  //           5=Clicks, 6=CTR, 7=CPC, 8=Frecuencia, 9=ROAS
+  const datosCampana = sheet.getRange(2, 1, 15, 10).getValues()
     .filter(fila => fila[0] !== '');
 
-  // Leer adsets (fila 20 headers, filas 21-35)
-  const headersAdset = sheet.getRange(20, 1, 1, 9).getValues()[0];
-  const datosAdset = sheet.getRange(21, 1, 15, 9).getValues()
+  // Adsets: 0=Campaña, 1=Adset, 2=Estado, 3=Días, 4=Gasto
+  //         5=Impresiones, 6=Clicks, 7=CTR, 8=CPC, 9=Frecuencia, 10=ROAS
+  const datosAdset = sheet.getRange(21, 1, 15, 11).getValues()
     .filter(fila => fila[0] !== '');
 
-  // Leer anuncios (fila 40 headers, filas 41-80)
-  const headersAnuncio = sheet.getRange(40, 1, 1, 10).getValues()[0];
-  const datosAnuncio = sheet.getRange(41, 1, 40, 10).getValues()
+  // Anuncios: 0=Campaña, 1=Adset, 2=Anuncio, 3=Estado, 4=Días
+  //           5=Gasto, 6=Impresiones, 7=Clicks, 8=CTR, 9=CPC, 10=Frecuencia, 11=ROAS
+  const datosAnuncio = sheet.getRange(41, 1, 40, 12).getValues()
     .filter(fila => fila[0] !== '');
 
-  // Formatear campañas
-  let textoCampanas = '## NIVEL CAMPAÑA\n';
+  let texto = `## CONTEXTO ACTIVO\n${contextoActivo}\n\n`;
+
+  // Campañas
+  texto += '## NIVEL CAMPAÑA\n';
   datosCampana.forEach(fila => {
-    textoCampanas += `
+    const enAprendizaje = fila[2] < 7 ? '⚠️ EN APRENDIZAJE' : '';
+    const estadoIcon = fila[1] === 'PAUSED' ? '⏸️ PAUSADA' : '▶️ ACTIVA';
+    texto += `
 Campaña: ${fila[0]}
-Gasto: ${fila[1].toLocaleString()} CLP
-Impresiones: ${fila[2].toLocaleString()}
-Clicks: ${fila[3].toLocaleString()}
-CTR: ${fila[4]}
-CPC: ${fila[5]} CLP
-Frecuencia: ${fila[6]}
-ROAS: ${fila[7]}
+Estado: ${estadoIcon} ${enAprendizaje} | Días activa: ${fila[2]}
+Gasto: ${Number(fila[3]).toLocaleString()} CLP | CTR: ${fila[6]} | CPC: ${fila[7]} CLP | Frecuencia: ${fila[8]} | ROAS: ${fila[9]}
 ---`;
   });
 
-  // Formatear adsets
-  let textoAdsets = '\n## NIVEL ADSET\n';
+  // Adsets
+  texto += '\n## NIVEL ADSET\n';
   datosAdset.forEach(fila => {
-    textoAdsets += `
+    const enAprendizaje = fila[3] < 7 ? '⚠️ EN APRENDIZAJE' : '';
+    const estadoIcon = fila[2] === 'PAUSED' ? '⏸️ PAUSADO' : '▶️ ACTIVO';
+    texto += `
 Campaña: ${fila[0]} | Adset: ${fila[1]}
-Gasto: ${fila[2].toLocaleString()} CLP | CTR: ${fila[5]} | CPC: ${fila[6]} CLP
-Frecuencia: ${fila[7]} | ROAS: ${fila[8]}
+Estado: ${estadoIcon} ${enAprendizaje} | Días activa: ${fila[3]}
+Gasto: ${Number(fila[4]).toLocaleString()} CLP | CTR: ${fila[7]} | CPC: ${fila[8]} CLP | Frecuencia: ${fila[9]} | ROAS: ${fila[10]}
 ---`;
   });
 
-  // Formatear anuncios — solo los relevantes (gasto > 0 y ROAS conocido)
-  let textoAnuncios = '\n## NIVEL ANUNCIO\n';
+  // Anuncios
+  texto += '\n## NIVEL ANUNCIO\n';
   datosAnuncio
-    .filter(fila => fila[3] > 0 && fila[9] > 0)
-    .sort((a, b) => b[9] - a[9]) // ordenar por ROAS descendente
+    .filter(fila => fila[5] > 0 && fila[11] > 0)
+    .sort((a, b) => b[11] - a[11])
     .forEach(fila => {
-      textoAnuncios += `
+      const enAprendizaje = fila[4] < 7 ? '⚠️ EN APRENDIZAJE' : '';
+      const estadoIcon = fila[3] === 'PAUSED' ? '⏸️ PAUSADO' : '▶️ ACTIVO';
+      texto += `
 Anuncio: ${fila[2]} | Adset: ${fila[1]}
-Gasto: ${fila[3].toLocaleString()} CLP | CTR: ${fila[6]} | ROAS: ${fila[9]}
+Estado: ${estadoIcon} ${enAprendizaje} | Días activa: ${fila[4]}
+Gasto: ${Number(fila[5]).toLocaleString()} CLP | CTR: ${fila[8]} | ROAS: ${fila[11]}
 ---`;
     });
 
-  const textoCompleto = textoCampanas + textoAdsets + textoAnuncios;
-  Logger.log(textoCompleto);
-  return textoCompleto;
+  Logger.log(texto);
+  return texto;
 }
 function runFullAnalysis() {
   const data = unificarData();
   
+  // Leer Config
   const configSheet = SpreadsheetApp.getActiveSpreadsheet()
                         .getSheetByName('Config');
   const configData = configSheet.getDataRange().getValues();
-  
-  // Leer config
   let config = {};
   configData.forEach(fila => {
     if (fila[0] && fila[1]) config[fila[0]] = fila[1];
   });
 
-  const prompt = `
-Eres un estratega senior de paid media para ${config['Negocio'] || 'cadacosaensulugar.cl'}, un ecommerce chileno de organización del hogar con ${config['Margen bruto promedio'] || '60%'} de margen bruto.
+  // Leer Memoria
+  const memoriaSheet = SpreadsheetApp.getActiveSpreadsheet()
+                         .getSheetByName('Memoria');
+  const memoriaData = memoriaSheet.getDataRange().getValues();
+  let memoria = '';
+  memoriaData.forEach(fila => {
+    if (fila[0] && fila[1]) {
+      memoria += `${fila[0]}: ${fila[1]}\n`;
+    }
+  });
 
-BENCHMARKS DEL NEGOCIO:
-- ROAS objetivo: ${config['ROAS objetivo retargeting'] || '5.0'}
-- ROAS mínimo prospecting: ${config['ROAS objetivo prospecting'] || '3.0'}
+  const systemPrompt = `
+Eres el estratega senior de paid media de ${config['Negocio'] || 'cadacosaensulugar.cl'}.
+
+No eres un asistente genérico — conoces este negocio en profundidad y tomas decisiones basadas en su historia, sus productos y sus aprendizajes acumulados.
+
+CONOCIMIENTO DEL NEGOCIO:
+${memoria}
+
+BENCHMARKS OPERATIVOS:
+- ROAS objetivo retargeting: ${config['ROAS objetivo retargeting'] || '5.0'}
+- ROAS objetivo prospecting: ${config['ROAS objetivo prospecting'] || '3.0'}
 - ROAS alerta roja: ${config['ROAS mínimo absoluto (alerta roja)'] || '1.7'}
 - Frecuencia máxima: ${config['Frecuencia máxima retargeting'] || '5.0'}
 - CTR promedio cuenta: ${config['CTR promedio Meta'] || '1.80%'}
 - Ticket promedio: ${config['Ticket promedio (CLP)'] || '63629'} CLP
+- Margen bruto: ${config['Margen bruto promedio'] || '60%'}
 
-CONTEXTO ACTIVO: ${config['Contexto activo'] || 'Sin contexto especial'}
+CONTEXTO ACTIVO ESTA SEMANA:
+${config['Contexto activo'] || 'Sin contexto especial'}
 
+REGLAS DE ANÁLISIS:
+- Nunca evalúes campañas con menos de 7 días activas por ROAS — están en aprendizaje
+- En períodos Black/Cyber acepta ROAS desde 2.5 antes de pausar
+- Prioriza siempre recomendaciones a nivel de anuncio — ahí está la palanca real
+- Si un campo de memoria dice POR EXPLORAR, ignóralo en el análisis
+- Cruza siempre los tres niveles antes de recomendar: campaña → adset → anuncio
+`;
+
+  const userPrompt = `
 DATOS DE CAMPAÑAS (últimos 7 días):
 ${data}
 
-Responde estas 5 preguntas con datos concretos:
+Analiza y responde estas 5 preguntas:
 
-1. ¿Qué campañas deben pausarse o revisarse urgente? (justifica con ROAS vs benchmark)
-2. ¿Qué campañas tienen ROAS sobre objetivo y pueden escalar presupuesto?
-3. ¿Qué categoría de producto está generando el mejor retorno?
-4. ¿Qué anuncios específicos tienen mejor performance y deben replicarse?
-5. ¿Cuál es la acción de mayor palanca esta semana?
+1. ¿Qué campañas o adsets deben pausarse o revisarse urgente? (justifica con datos)
+2. ¿Qué campañas tienen ROAS sobre objetivo y pueden escalar presupuesto? ¿Cuánto?
+3. ¿Qué anuncios específicos deben replicarse o escalarse esta semana?
+4. ¿Qué está faltando — audiencias, creativos o configuraciones que vale la pena explorar?
+5. ¿Cuál es la acción de mayor palanca esta semana? Una sola, concreta y ejecutable hoy.
 
-Formato de respuesta:
-- Usa los tres niveles (campaña, adset, anuncio) para justificar cada recomendación
-- Sé directo y específico — nombra campañas y anuncios reales
-- Máximo 15 líneas en total
+Formato: directo, sin adornos. Nombra campañas y anuncios reales. Máximo 20 líneas.
 `;
 
-  const resultado = callClaude(prompt);
-  
+  const payload = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1500,
+    system: systemPrompt,
+    messages: [
+      { role: 'user', content: userPrompt }
+    ]
+  };
+
+  const apiKey = PropertiesService.getScriptProperties()
+                   .getProperty('ANTHROPIC_API_KEY');
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', options);
+  const result = JSON.parse(response.getContentText());
+  const resultado = result.content[0].text;
+
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
                   .getSheetByName('Análisis');
-  
-  // Limpiar análisis anterior
-  sheet.getRange('A1:B10').clearContent();
-  
+  sheet.getRange('A1:B20').clearContent();
   sheet.getRange('A1').setValue('Reporte semanal — ' + new Date().toLocaleDateString('es-CL'));
   sheet.getRange('A2').setValue(resultado);
   sheet.getRange('A2').setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
-  
+
   Logger.log(resultado);
-  
   SpreadsheetApp.getUi().alert('✅ Análisis completado. Revisa la pestaña Análisis.');
 }
 function onOpen() {
