@@ -216,6 +216,58 @@ function getMetaAdsData() {
 
   return data;
 }
+function getMetaAdsData30() {
+  const token = PropertiesService.getScriptProperties()
+                  .getProperty('META_ACCESS_TOKEN');
+  
+  const urlAccount = `https://graph.facebook.com/v19.0/me/adaccounts?fields=id&access_token=${token}`;
+  const responseAccount = UrlFetchApp.fetch(urlAccount, {muteHttpExceptions: true});
+  const dataAccount = JSON.parse(responseAccount.getContentText());
+  
+  if (!dataAccount.data || dataAccount.data.length === 0) {
+    Logger.log('Error: No se encontraron cuentas');
+    return null;
+  }
+  
+  const adAccountId = dataAccount.data[0].id;
+
+  // Últimos 30 días
+  const fechaHoy = new Date();
+  const fecha30dias = new Date(fechaHoy - 30 * 24 * 60 * 60 * 1000);
+  const fechaInicio = fecha30dias.toISOString().split('T')[0];
+  const fechaFin = fechaHoy.toISOString().split('T')[0];
+  
+  const fields = 'campaign_name,spend,impressions,clicks,ctr,cpc,frequency,reach,actions,action_values';
+  const timeRange = encodeURIComponent(JSON.stringify({since: fechaInicio, until: fechaFin}));
+  const url = `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=${fields}&time_range=${timeRange}&level=campaign&access_token=${token}`;
+  
+  const response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  const data = JSON.parse(response.getContentText());
+  
+  // Construir mapa nombre → ROAS 30 días
+  const mapa30 = {};
+  if (data.data) {
+    data.data.forEach(c => {
+      const gasto = parseFloat(c.spend) || 0;
+      let valorConversion = 0;
+      if (c.action_values) {
+        const purchase = c.action_values.find(
+          a => a.action_type === 'offsite_conversion.fb_pixel_purchase'
+        );
+        if (purchase) valorConversion = parseFloat(purchase.value);
+      }
+      const roas30 = gasto > 0 ? (valorConversion / gasto).toFixed(2) : 0;
+      mapa30[c.campaign_name] = {
+        roas30: roas30,
+        gasto30: gasto,
+        ctr30: parseFloat(c.ctr || 0).toFixed(2)
+      };
+    });
+  }
+
+  Logger.log('ROAS 30 días: ' + JSON.stringify(mapa30));
+  return mapa30;
+}
 function procesarMetaAPI() {
   const data = getMetaAdsData();
   if (!data || !data.data) {
@@ -490,6 +542,9 @@ function unificarData() {
     if (fila[0] === 'Contexto activo') contextoActivo = fila[1];
   });
 
+  // Traer ROAS 30 días
+  const mapa30 = getMetaAdsData30();
+
   // Campañas: 0=Nombre, 1=Estado, 2=Días, 3=Gasto, 4=Impresiones
   //           5=Clicks, 6=CTR, 7=CPC, 8=Frecuencia, 9=ROAS
   const datosCampana = sheet.getRange(2, 1, 15, 10).getValues()
@@ -507,15 +562,33 @@ function unificarData() {
 
   let texto = `## CONTEXTO ACTIVO\n${contextoActivo}\n\n`;
 
-  // Campañas
-  texto += '## NIVEL CAMPAÑA\n';
+  // Campañas con comparación 7 vs 30 días
+  texto += '## NIVEL CAMPAÑA (7 días vs 30 días)\n';
   datosCampana.forEach(fila => {
     const enAprendizaje = fila[2] < 7 ? '⚠️ EN APRENDIZAJE' : '';
     const estadoIcon = fila[1] === 'PAUSED' ? '⏸️ PAUSADA' : '▶️ ACTIVA';
+    const roas7 = fila[9];
+    const historico = mapa30 && mapa30[fila[0]];
+    const roas30 = historico ? historico.roas30 : 'N/D';
+    const gasto30 = historico ? Number(historico.gasto30).toLocaleString() : 'N/D';
+    const ctr30 = historico ? historico.ctr30 : 'N/D';
+
+    // Señal de tendencia
+    let tendencia = '';
+    if (historico && roas7 > 0) {
+      const diff = roas7 - parseFloat(roas30);
+      if (diff > 0.5) tendencia = '📈 MEJORANDO vs historial';
+      else if (diff < -0.5) tendencia = '📉 BAJANDO vs historial';
+      else tendencia = '➡️ ESTABLE vs historial';
+    }
+
     texto += `
 Campaña: ${fila[0]}
 Estado: ${estadoIcon} ${enAprendizaje} | Días activa: ${fila[2]}
-Gasto: ${Number(fila[3]).toLocaleString()} CLP | CTR: ${fila[6]} | CPC: ${fila[7]} CLP | Frecuencia: ${fila[8]} | ROAS: ${fila[9]}
+ROAS 7 días: ${roas7} | ROAS 30 días: ${roas30} ${tendencia}
+Gasto 7 días: ${Number(fila[3]).toLocaleString()} CLP | Gasto 30 días: ${gasto30} CLP
+CTR 7 días: ${fila[6]} | CTR 30 días: ${ctr30}%
+CPC: ${fila[7]} CLP | Frecuencia: ${fila[8]}
 ---`;
   });
 
@@ -527,7 +600,8 @@ Gasto: ${Number(fila[3]).toLocaleString()} CLP | CTR: ${fila[6]} | CPC: ${fila[7
     texto += `
 Campaña: ${fila[0]} | Adset: ${fila[1]}
 Estado: ${estadoIcon} ${enAprendizaje} | Días activa: ${fila[3]}
-Gasto: ${Number(fila[4]).toLocaleString()} CLP | CTR: ${fila[7]} | CPC: ${fila[8]} CLP | Frecuencia: ${fila[9]} | ROAS: ${fila[10]}
+Gasto: ${Number(fila[4]).toLocaleString()} CLP | CTR: ${fila[7]} | CPC: ${fila[8]} CLP
+Frecuencia: ${fila[9]} | ROAS: ${fila[10]}
 ---`;
   });
 
@@ -700,22 +774,165 @@ Sé directo y técnico. Usa los frameworks de diagnóstico. Máximo 25 líneas.
   const result = JSON.parse(response.getContentText());
   const resultado = result.content[0].text;
 
+  // Agente 1 escribe reporte de performance
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
                   .getSheetByName('Análisis');
-  sheet.getRange('A1:B30').clearContent();
+  sheet.getRange('A1:B50').clearContent();
   sheet.getRange('A1').setValue('Reporte semanal — ' + new Date().toLocaleDateString('es-CL'));
   sheet.getRange('A2').setValue(resultado);
   sheet.getRange('A2').setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
 
-  Logger.log(resultado);
-  SpreadsheetApp.getUi().alert('✅ Análisis completado. Revisa la pestaña Análisis.');
+  // Agente 2 — análisis estratégico
+  Logger.log('Corriendo Agente 2 — análisis estratégico...');
+  const analisisEstrategico = runStrategicAnalysis(resultado);
+  
+  sheet.getRange('A20').setValue('── ANÁLISIS ESTRATÉGICO ──');
+  sheet.getRange('A20').setFontWeight('bold');
+  sheet.getRange('A21').setValue(analisisEstrategico);
+  sheet.getRange('A21').setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+
+  Logger.log(analisisEstrategico);
+  SpreadsheetApp.getUi().alert('✅ Análisis completo. Revisa la pestaña Análisis — tienes reporte + estrategia.');
 }
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('🤖 Agente Marketing')
+    .addItem('🚀 ANÁLISIS COMPLETO (1 click)', 'runAll')
+    .addSeparator()
     .addItem('Correr análisis semanal', 'runFullAnalysis')
     .addItem('Actualizar data Meta', 'procesarMetaAPI')
     .addItem('Actualizar adsets', 'getMetaAdsetData')
     .addItem('Actualizar anuncios', 'getMetaAdData')
     .addToUi();
+}
+function runAll() {
+  const ui = SpreadsheetApp.getUi();
+  
+  try {
+    ui.alert('🔄 Paso 1/4 — Actualizando campañas...');
+    procesarMetaAPI();
+    
+    ui.alert('🔄 Paso 2/4 — Actualizando adsets...');
+    getMetaAdsetData();
+    
+    ui.alert('🔄 Paso 3/4 — Actualizando anuncios...');
+    getMetaAdData();
+    
+    ui.alert('🔄 Paso 4/4 — Corriendo análisis...');
+    runFullAnalysis();
+    
+  } catch(e) {
+    ui.alert('❌ Error en el pipeline: ' + e.message);
+    Logger.log('Error runAll: ' + e.toString());
+  }
+}
+function runStrategicAnalysis(reporteAgente1) {
+  const configSheet = SpreadsheetApp.getActiveSpreadsheet()
+                        .getSheetByName('Config');
+  const configData = configSheet.getDataRange().getValues();
+  let config = {};
+  configData.forEach(fila => {
+    if (fila[0] && fila[1]) config[fila[0]] = fila[1];
+  });
+
+  const memoriaSheet = SpreadsheetApp.getActiveSpreadsheet()
+                         .getSheetByName('Memoria');
+  const memoriaData = memoriaSheet.getDataRange().getValues();
+  let memoria = '';
+  memoriaData.forEach(fila => {
+    if (fila[0] && fila[1]) memoria += `${fila[0]}: ${fila[1]}\n`;
+  });
+
+  const systemPrompt = `
+Eres un consultor senior de paid media con 10 años de experiencia en Meta Ads para ecommerce.
+
+Tu rol NO es analizar números — eso ya lo hizo otro agente. Tu rol es pensar estratégicamente: identificar lo que falta, proponer experimentos concretos y detectar oportunidades que el operador no está viendo.
+
+CONOCIMIENTO DEL NEGOCIO:
+${memoria}
+
+CONTEXTO ACTIVO: ${config['Contexto activo'] || 'Sin contexto especial'}
+
+UNIVERSO DE POSIBILIDADES EN META ADS QUE DEBES EVALUAR:
+
+TIPOS DE CAMPAÑA:
+- Advantage+ Shopping: automatización total, Meta optimiza audiencia y placement. Ideal cuando tienes suficiente data de pixel (50+ compras/semana).
+- CBO prospecting: múltiples adsets con audiencias distintas compitiendo por presupuesto. Meta aprende cuál funciona mejor.
+- ABO testing: presupuesto fijo por adset para testear creativos o audiencias de forma controlada sin que Meta favorezca ninguno.
+- Retargeting dinámico: catálogo mostrando productos específicos que el usuario vio pero no compró.
+- Video Views: campaña de awareness para construir audiencia de viewers que luego se retargeta. Costo muy bajo por view.
+
+AUDIENCIAS NO EXPLORADAS:
+- Lookalike 1-3% de compradores: la audiencia más valiosa — Meta busca personas similares a tus mejores clientes.
+- Lookalike de visitantes top 25% tiempo en sitio: personas similares a los que más se interesan en tu tienda.
+- Viewers de video 75%+: audiencia de personas que vieron tus videos hasta el final — alta intención, ideal para MOFU.
+- Customer list: subir lista de emails de compradores para crear LAL o para excluir de prospecting.
+- Engagement audience 365 días: todos los que interactuaron con tu página o ads en el último año.
+
+CREATIVOS NO EXPLORADOS:
+- Reels con texto en pantalla sin narración: funciona en entornos sin sonido, alto thumb-stop rate.
+- Carrusel de beneficios: cada slide un beneficio del producto, termina con CTA. Funciona bien en retargeting.
+- UGC de clientes reales: testimonios filmados por los propios compradores. Mayor credibilidad que producción profesional.
+- Video de problema/solución en 15 segundos: hook con el dolor, solución con el producto, CTA directo.
+- Comparación antes/después: especialmente efectivo para productos de organización del hogar.
+
+ESTRUCTURA DE FUNNEL COMPLETO:
+- TOFU: Video Views o prospecting broad → construye audiencia barata
+- MOFU: Retargeting a viewers 75% y visitantes → educa y genera consideración  
+- BOFU: Catálogo dinámico + retargeting a add-to-cart → cierra la venta
+- Retención: Customer list de compradores → upsell y cross-sell
+
+REGLAS DE RAZONAMIENTO:
+- Siempre evalúa si el presupuesto disponible justifica el experimento propuesto
+- Prioriza por palanca: qué tiene mayor impacto potencial con menor riesgo
+- No proponer más de 3 experimentos concretos — foco es más valioso que variedad
+- Cada propuesta debe incluir: qué probar, cómo configurarlo, qué métrica define éxito
+- Considera el contexto temporal: no proponer experimentos largos si hay un evento especial activo
+`;
+
+  const userPrompt = `
+REPORTE DE PERFORMANCE DE LA SEMANA (generado por el agente analítico):
+${reporteAgente1}
+
+Basándote en este reporte y en tu conocimiento del negocio y del universo de posibilidades de Meta Ads, responde:
+
+1. GAPS ESTRATÉGICOS: ¿Qué etapa del funnel está descubierta o débil? ¿Qué está faltando que un paid media senior vería inmediatamente?
+
+2. EXPERIMENTOS PRIORITARIOS: 3 experimentos concretos y ejecutables — ordenados por potencial de impacto. Para cada uno: qué es, cómo configurarlo exactamente, y qué ROAS o métrica define si funcionó.
+
+3. AUDIENCIAS SIN EXPLOTAR: ¿Qué audiencia específica vale la pena crear esta semana y por qué?
+
+4. CREATIVO QUE FALTA: ¿Qué tipo de creativo no existe en la cuenta y debería existir? ¿Qué brief le darías al creador?
+
+5. VISIÓN 30 DÍAS: Si tuvieras que llevar esta cuenta de ROAS 3.5 promedio a ROAS 5+ en 30 días, ¿cuáles serían los 3 movimientos en orden?
+
+Sé específico y técnico. Usa nombres reales de campañas cuando sea relevante. Máximo 25 líneas.
+`;
+
+  const payload = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 2000,
+    system: systemPrompt,
+    messages: [
+      { role: 'user', content: userPrompt }
+    ]
+  };
+
+  const apiKey = PropertiesService.getScriptProperties()
+                   .getProperty('ANTHROPIC_API_KEY');
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', options);
+  const result = JSON.parse(response.getContentText());
+  return result.content[0].text;
 }
